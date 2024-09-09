@@ -40,6 +40,8 @@ pub fn connect_to_moonraker(url: &str, printer_rx: Receiver<PrinterCommand>) {
     let (mut receiver, mut sender) = client.split().unwrap();
 
     let printer_state = Arc::new(Mutex::new(PrinterState::default()));
+    let sender_state = Arc::clone(&printer_state);
+    let receiver_state = Arc::clone(&printer_state);
 
     let id_generator = Arc::new(IdGenerator::new(0));
 
@@ -60,17 +62,7 @@ pub fn connect_to_moonraker(url: &str, printer_rx: Receiver<PrinterCommand>) {
         let _ = send_websocket_message(&mut sender, &subscribe_message);
 
         for cmd in printer_rx {
-            let gcode = cmd.to_string();
-
-            let gcode_message = json!({
-                "jsonrpc": "2.0",
-                "method": "printer.gcode.script",
-                "params": {
-                    "script": gcode,
-                },
-                "id": id_generator.next_id()
-            });
-            let _ = send_websocket_message(&mut sender, &gcode_message);
+            send_gcode_command(&mut sender, Arc::clone(&id_generator), Arc::clone(&sender_state), cmd);
         }
     });
 
@@ -80,8 +72,8 @@ pub fn connect_to_moonraker(url: &str, printer_rx: Receiver<PrinterCommand>) {
             match message {
                 Ok(websocket::OwnedMessage::Text(text)) => {
                     let json: Value = serde_json::from_str(&text).unwrap();
-
-                    update_printer_state(&printer_state, &json);
+                    log_recv(&json);
+                    update_printer_state(&receiver_state, &json);
                 }
                 Ok(websocket::OwnedMessage::Close(_)) => {
                     break;
@@ -90,6 +82,16 @@ pub fn connect_to_moonraker(url: &str, printer_rx: Receiver<PrinterCommand>) {
             }
         }
     });
+}
+
+fn log_recv(json: &Value) {
+    if let Some(method) = json.get("method") {
+        match method.as_str().unwrap() {
+            "notify_status_update" => {},
+            "notify_proc_stat_update" => {},
+            _ => println!("recv: {}", serde_json::to_string_pretty(&json).unwrap())
+        }
+    }
 }
 
 fn update_printer_state(printer_state: &Arc<Mutex<PrinterState>>, json: &Value) {
@@ -126,8 +128,32 @@ fn update_from_status(state: &mut PrinterState, status: &Value) {
             }
         }
     }
+}
 
-
+fn send_gcode_command(mut sender: &mut Writer<TcpStream>, id_generator: Arc<IdGenerator>, printer_state: Arc<Mutex<PrinterState>>, command: PrinterCommand) {
+    let mut send_msg = |gcode| {
+        let gcode_message = json!({
+                "jsonrpc": "2.0",
+                "method": "printer.gcode.script",
+                "params": {
+                    "script": gcode,
+                },
+                "id": id_generator.next_id()
+            });
+        let _ = send_websocket_message(&mut sender, &gcode_message);
+    };
+    match command {
+        PrinterCommand::Move(m) => {
+            let state = printer_state.lock().unwrap();
+            if state.absolute_coordinates || state.homed_axes != "xyz" {
+                eprintln!("Refusing move in bad printer state: {:?}", state)
+            } else {
+                send_msg(m.to_string())
+            }
+        }
+        PrinterCommand::Home => { send_msg("G28".to_string()) }
+        PrinterCommand::SetRelativeMotion => { send_msg("G91".to_string()) }
+    }
 }
 fn send_websocket_message(sender: &mut Writer<TcpStream>, message: &Value) -> WebSocketResult<()> {
     println!("send: {}", serde_json::to_string_pretty(&message).unwrap());

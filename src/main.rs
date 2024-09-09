@@ -10,11 +10,11 @@ use std::sync::mpsc;
 use crate::moonraker_api::connect_to_moonraker;
 
 fn main() {
-    // Start the SpaceMouse thread and get the receiver
-    let spacemouse_rx = start_spacemouse_thread();
-
     // Create a channel for printer commands
     let (printer_tx, printer_rx) = mpsc::channel();
+
+    // Start the SpaceMouse thread and get the receiver
+    let spacemouse_rx = start_spacemouse_thread(printer_tx.clone());
 
     // Start the motion command generation thread
     let motion_thread = start_motion_thread(spacemouse_rx, printer_tx.clone());
