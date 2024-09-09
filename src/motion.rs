@@ -1,6 +1,5 @@
 use crate::constants::{printer_update_interval, PRINTER_TIME_STEP, SCALE_FACTORS};
 use crate::types::SpaceMouseState;
-use std::fmt::Display;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
