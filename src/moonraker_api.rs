@@ -37,7 +37,9 @@ pub fn connect_to_moonraker(url: &str, printer_rx: Receiver<PrinterCommand>) {
         .connect_insecure()
         .unwrap();
 
-    let (mut receiver, mut sender) = client.split().unwrap();
+    let (mut receiver, s) = client.split().unwrap();
+    let sender = Arc::new(Mutex::new(s));
+    let pingpong_sender = Arc::clone(&sender);
 
     let printer_state = Arc::new(Mutex::new(PrinterState::default()));
     let sender_state = Arc::clone(&printer_state);
@@ -59,10 +61,11 @@ pub fn connect_to_moonraker(url: &str, printer_rx: Receiver<PrinterCommand>) {
             },
             "id": id_generator.next_id()
         });
-        let _ = send_websocket_message(&mut sender, &subscribe_message);
+        let mut s = sender.lock().unwrap();
+        let _ = send_websocket_message(&mut s, &subscribe_message);
 
         for cmd in printer_rx {
-            send_gcode_command(&mut sender, Arc::clone(&id_generator), Arc::clone(&sender_state), cmd);
+            send_gcode_command(&mut s, Arc::clone(&id_generator), Arc::clone(&sender_state), cmd);
         }
     });
 
@@ -78,7 +81,16 @@ pub fn connect_to_moonraker(url: &str, printer_rx: Receiver<PrinterCommand>) {
                 Ok(websocket::OwnedMessage::Close(_)) => {
                     break;
                 }
-                _ => {}
+                Ok(websocket::OwnedMessage::Ping(d)) => {
+                    println!("Ping!");
+                    pingpong_sender.lock().unwrap().send_message(&websocket::Message::pong(d)).unwrap();
+                }
+                Ok(other) => {
+                    eprintln!("Unexpected websocket message: {:?}", other);
+                }
+                Err(e) => {
+                    eprintln!("websocket error: {}", e);
+                }
             }
         }
     });
@@ -89,7 +101,7 @@ fn log_recv(json: &Value) {
         match method.as_str().unwrap() {
             "notify_status_update" => {},
             "notify_proc_stat_update" => {},
-            _ => println!("recv: {}", serde_json::to_string_pretty(&json).unwrap())
+            _ => {} //println!("recv: {}", serde_json::to_string_pretty(&json).unwrap())
         }
     }
 }
