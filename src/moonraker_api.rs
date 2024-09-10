@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use websocket::sender::Writer;
 use websocket::{ClientBuilder, WebSocketResult};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Default)]
 pub struct PrinterState {
@@ -49,6 +50,21 @@ pub fn connect_to_moonraker(url: &str, printer_rx: Receiver<PrinterCommand>) {
 
     // Sending thread
     thread::spawn(move || {
+        // Identify message
+        let identify_message = json!({
+            "jsonrpc": "2.0",
+            "method": "server.connection.identify",
+            "params": {
+                "client_name": "antigrav",
+                "version": "0.1.0",
+                "type": "web",
+                "url": "https://github.com/bo0tzz/antigrav"
+            },
+            "id": id_generator.next_id()
+        });
+        let mut s = sender.lock().unwrap();
+        let _ = send_websocket_message(&mut s, &identify_message);
+
         // Subscribe to toolhead and gcode_move objects
         let subscribe_message = json!({
             "jsonrpc": "2.0",
@@ -61,15 +77,15 @@ pub fn connect_to_moonraker(url: &str, printer_rx: Receiver<PrinterCommand>) {
             },
             "id": id_generator.next_id()
         });
-        let mut s = sender.lock().unwrap();
         let _ = send_websocket_message(&mut s, &subscribe_message);
 
         for cmd in printer_rx {
             send_gcode_command(&mut s, Arc::clone(&id_generator), Arc::clone(&sender_state), cmd);
         }
-    });
+    });;
 
     // Receiving thread
+
     thread::spawn(move || {
         for message in receiver.incoming_messages() {
             match message {
@@ -78,18 +94,26 @@ pub fn connect_to_moonraker(url: &str, printer_rx: Receiver<PrinterCommand>) {
                     log_recv(&json);
                     update_printer_state(&receiver_state, &json);
                 }
-                Ok(websocket::OwnedMessage::Close(_)) => {
+                Ok(websocket::OwnedMessage::Close(m)) => {
+                    eprintln!("Connection closed by server: {:?}", m);
                     break;
                 }
                 Ok(websocket::OwnedMessage::Ping(d)) => {
-                    println!("Ping!");
-                    pingpong_sender.lock().unwrap().send_message(&websocket::Message::pong(d)).unwrap();
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+                    println!("[{:?}] Received ping: {:?}", now, d);
+                    let pong_payload = if d.is_empty() { b"pong".to_vec() } else { d };
+                    let pong_message = websocket::Message::pong(pong_payload);
+                    println!("[{:?}] Sending pong: {:?}", now, pong_message);
+                    match pingpong_sender.lock().unwrap().send_message(&pong_message) {
+                        Ok(_) => println!("[{:?}] Sent pong successfully", now),
+                        Err(e) => eprintln!("[{:?}] Failed to send pong: {}", now, e),
+                    }
                 }
                 Ok(other) => {
                     eprintln!("Unexpected websocket message: {:?}", other);
                 }
                 Err(e) => {
-                    eprintln!("websocket error: {}", e);
+                    eprintln!("WebSocket error: {}", e);
                 }
             }
         }
@@ -99,10 +123,12 @@ pub fn connect_to_moonraker(url: &str, printer_rx: Receiver<PrinterCommand>) {
 fn log_recv(json: &Value) {
     if let Some(method) = json.get("method") {
         match method.as_str().unwrap() {
-            "notify_status_update" => {},
-            "notify_proc_stat_update" => {},
-            _ => {} //println!("recv: {}", serde_json::to_string_pretty(&json).unwrap())
+            "notify_status_update" => {}
+            "notify_proc_stat_update" => {}
+            _ => println!("recv: {}", serde_json::to_string_pretty(&json).unwrap())
         }
+    } else {
+        println!("recv: {}", serde_json::to_string_pretty(&json).unwrap())
     }
 }
 
