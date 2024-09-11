@@ -1,4 +1,5 @@
 use crate::types::PrinterCommand;
+use log::debug;
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use futures::{StreamExt};
@@ -56,6 +57,7 @@ impl RpcTracker {
 }
 
 pub async fn connect_to_moonraker(url: &str, mut printer_rx: Receiver<PrinterCommand>) {
+    debug!("Connecting to Moonraker at {}", url);
     let (ws_stream, _) = connect_async(url).await.expect("Can't connect");
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
@@ -70,6 +72,7 @@ pub async fn connect_to_moonraker(url: &str, mut printer_rx: Receiver<PrinterCom
                 "gcode_move": null
             }
     });
+    debug!("Subscribing to toolhead and gcode_move objects");
     send_rpc(&mut ws_sender, &mut id_generator, &rpc_tracker, "printer.objects.subscribe", subscribe_params).await.unwrap();
 
     loop {
@@ -77,15 +80,22 @@ pub async fn connect_to_moonraker(url: &str, mut printer_rx: Receiver<PrinterCom
             Some(cmd) = printer_rx.recv() => {
                 match cmd {
                     PrinterCommand::Move(m) => {
-                        println!("Received move command: {:?}", m);
+                        debug!("Received move command: {:?}", m);
                         if printer_state.absolute_coordinates || printer_state.homed_axes != "xyz" {
-                            eprintln!("Refusing move in bad printer state: {:?}", printer_state)
+                            debug!("Refusing move in bad printer state: {:?}", printer_state);
                         } else {
+                            debug!("Sending move command to Moonraker");
                             send_gcode_command(&mut ws_sender, &mut id_generator, &rpc_tracker, &m.to_string()).await.expect("Failed to send move command");
                         }
                     }
-                    PrinterCommand::Home => {send_gcode_command(&mut ws_sender, &mut id_generator, &rpc_tracker, "G28").await.expect("Failed to send home command");}
-                    PrinterCommand::SetRelativeMotion =>{ send_gcode_command(&mut ws_sender, &mut id_generator, &rpc_tracker, "G91").await.expect("Failed to send relative motion command");}
+                    PrinterCommand::Home => {
+                        debug!("Sending home command to Moonraker");
+                        send_gcode_command(&mut ws_sender, &mut id_generator, &rpc_tracker, "G28").await.expect("Failed to send home command");
+                    }
+                    PrinterCommand::SetRelativeMotion => {
+                        debug!("Sending set relative motion command to Moonraker");
+                        send_gcode_command(&mut ws_sender, &mut id_generator, &rpc_tracker, "G91").await.expect("Failed to send relative motion command");
+                    }
                 }
             }
             Some(Ok(msg)) = ws_receiver.next() => {
@@ -95,14 +105,17 @@ pub async fn connect_to_moonraker(url: &str, mut printer_rx: Receiver<PrinterCom
                         log_recv(&json);
                         if let Some(id) = json.get("id").and_then(|id| id.as_u64()) {
                             if let Some(duration) = rpc_tracker.stop_tracking(id).await {
-                                println!("RPC call with id {} took {:?}", id, duration);
+                                debug!("RPC call with id {} took {:?}", id, duration);
                             }
                         }
                         update_printer_state(&mut printer_state, &json).await;
                     }
-                    Message::Close(_) => break,
-                    Message::Ping(_) => println!("Ping!"),
-                    other => eprintln!("Unexpected websocket message: {:?}", other),
+                    Message::Close(_) => {
+                        debug!("WebSocket connection closed");
+                        break;
+                    }
+                    Message::Ping(_) => debug!("Received Ping from Moonraker"),
+                    other => debug!("Unexpected WebSocket message: {:?}", other),
                 }
             }
             else => break,
@@ -116,10 +129,10 @@ fn log_recv(json: &Value) {
             "notify_status_update" => {}
             "notify_proc_stat_update" => {}
             "notify_service_state_changed" => {}
-            _ => println!("recv: {}", serde_json::to_string_pretty(&json).unwrap())
+            _ => debug!("recv: {}", serde_json::to_string_pretty(&json).unwrap())
         }
     } else {
-        println!("recv: {}", serde_json::to_string_pretty(&json).unwrap())
+        debug!("recv: {}", serde_json::to_string_pretty(&json).unwrap())
     }
 }
 
@@ -142,7 +155,7 @@ fn update_from_status(state: &mut PrinterState, status: &Value) {
         if let Some(homed_axes) = toolhead.get("homed_axes") {
             if let Some(axes) = homed_axes.as_str() {
                 state.homed_axes = axes.to_string();
-                dbg!(&state);
+                debug!("{:?}", &state);
             }
         }
     }
@@ -150,7 +163,7 @@ fn update_from_status(state: &mut PrinterState, status: &Value) {
         if let Some(absolute_coordinates) = gcode_move.get("absolute_coordinates") {
             if let Some(value) = absolute_coordinates.as_bool() {
                 state.absolute_coordinates = value;
-                dbg!(&state);
+                debug!("{:?}", &state);
             }
         }
     }
@@ -171,7 +184,7 @@ async fn send_rpc(
         "id": id
     });
     rpc_tracker.start_tracking(id).await;
-    sender.send(Message::Text(rpc_message.to_string())).await?;
+    // sender.send(Message::Text(rpc_message.to_string())).await?;
     Ok(id)
 }
 
@@ -181,7 +194,7 @@ async fn send_gcode_command(
     rpc_tracker: &RpcTracker,
     gcode: &str,
 ) -> Result<u64, Error> {
-    println!("Sending GCode: {}", gcode);
+    debug!("Sending GCode: {}", gcode);
     send_rpc(sender, id_generator, rpc_tracker, "printer.gcode.script", json!({
         "script": gcode,
     })).await

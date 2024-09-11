@@ -12,22 +12,24 @@ pub async fn start_spacemouse_thread(command_tx: Sender<PrinterCommand>) -> Rece
         loop {
             match conn.wait() {
                 Ok(event) => {
+                    log::debug!("Received SpaceMouse event: {:?}", event);
                     match event {
                         Event::Motion(m) => {
                             motion_tx.send(m).await.expect("Failed to send SpaceMouse state");
+                            log::debug!("Sent SpaceMouse state");
                         },
                         Event::Button(b) => {
                             if b.press {
                                 match b.bnum {
                                     0 => command_tx.send(PrinterCommand::Home).await.unwrap(),
                                     1 => command_tx.send(PrinterCommand::SetRelativeMotion).await.unwrap(),
-                                    _ => eprintln!("unsupported button: {}", b.bnum),
+                                    _ => log::warn!("unsupported button: {}", b.bnum),
                                 }
                             }
                         }
                     }
                 }
-                Err(e) => eprintln!("Error reading SpaceMouse event: {:?}", e),
+                Err(e) => log::error!("Error reading SpaceMouse event: {:?}", e),
             }
         }
     });

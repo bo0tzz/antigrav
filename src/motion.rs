@@ -2,7 +2,7 @@ use crate::constants::{printer_update_interval, PRINTER_TIME_STEP, SCALE_FACTORS
 use log::debug;
 use crate::types::{MoveParameters, PrinterCommand, Velocity};
 use spacenav_plus::MotionEvent;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task;
 
@@ -16,24 +16,27 @@ pub async fn start_motion_thread(
 
     task::spawn(async move {
         loop {
+            debug!("Motion thread loop");
             tokio::select! {
-            Some(state) = spacemouse_rx.recv() => {
-                // Update velocity based on SpaceMouse state
-                // NOTE!: z and y axes are swapped here to map to the printer's movement system.
-                current_velocity.x = state.x as f32 * SCALE_FACTORS.x;
-                current_velocity.z = state.y as f32 * SCALE_FACTORS.z;
-                current_velocity.y = state.z as f32 * SCALE_FACTORS.y;
-                debug!("Updated velocity: {:?}", current_velocity);
+                Some(state) = spacemouse_rx.recv() => {
+                    debug!("Received SpaceMouse event in motion thread: {:?}", state);
+                    // Update velocity based on SpaceMouse state
+                    // NOTE!: z and y axes are swapped here to map to the printer's movement system.
+                    current_velocity.x = state.x as f32 * SCALE_FACTORS.x;
+                    current_velocity.z = state.y as f32 * SCALE_FACTORS.z;
+                    current_velocity.y = state.z as f32 * SCALE_FACTORS.y;
+                    debug!("Updated velocity: {:?}", current_velocity);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(1000)) => {
+                    debug!("Hit motion thread else branch");
+                    if last_command_time.elapsed() >= printer_update_interval() && current_velocity != last_handled_velocity {
+                        last_handled_velocity = current_velocity.clone();
+                        generate_motion_commands(current_velocity.clone(), &printer_tx).await;
+                        debug!("Generated motion commands for velocity: {:?}", current_velocity);
+                        last_command_time = Instant::now();
+                    }
+                }
             }
-            else => {
-                if last_command_time.elapsed() >= printer_update_interval() && current_velocity != last_handled_velocity {
-                    last_handled_velocity = current_velocity.clone();
-                    generate_motion_commands(current_velocity.clone(), &printer_tx).await;
-                    debug!("Generated motion commands for velocity: {:?}", current_velocity);
-                last_command_time = Instant::now();
-            }
-            }
-        }
         }
     });
 }
