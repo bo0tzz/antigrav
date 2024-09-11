@@ -8,6 +8,9 @@ use tokio::sync::mpsc::Receiver;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::Error;
+use std::collections::HashMap;
+use std::time::{Instant, Duration};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Default)]
 pub struct PrinterState {
@@ -30,12 +33,35 @@ impl IdGenerator {
     }
 }
 
+struct RpcTracker {
+    start_times: Mutex<HashMap<u64, Instant>>,
+}
+
+impl RpcTracker {
+    fn new() -> Self {
+        RpcTracker {
+            start_times: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn start_tracking(&self, id: u64) {
+        let mut start_times = self.start_times.lock().await;
+        start_times.insert(id, Instant::now());
+    }
+
+    async fn stop_tracking(&self, id: u64) -> Option<Duration> {
+        let mut start_times = self.start_times.lock().await;
+        start_times.remove(&id).map(|start| start.elapsed())
+    }
+}
+
 pub async fn connect_to_moonraker(url: &str, mut printer_rx: Receiver<PrinterCommand>) {
     let (ws_stream, _) = connect_async(url).await.expect("Can't connect");
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     let mut id_generator = IdGenerator::new(0);
     let mut printer_state = PrinterState::default();
+    let rpc_tracker = RpcTracker::new();
 
     // Subscribe to toolhead and gcode_move objects
     let subscribe_params = json!({
@@ -44,21 +70,22 @@ pub async fn connect_to_moonraker(url: &str, mut printer_rx: Receiver<PrinterCom
                 "gcode_move": null
             }
     });
-    send_rpc(&mut ws_sender, &mut id_generator, "printer.objects.subscribe", subscribe_params).await.unwrap();
+    send_rpc(&mut ws_sender, &mut id_generator, &rpc_tracker, "printer.objects.subscribe", subscribe_params).await.unwrap();
 
     loop {
         tokio::select! {
             Some(cmd) = printer_rx.recv() => {
                 match cmd {
                     PrinterCommand::Move(m) => {
+                        println!("Received move command: {:?}", m);
                         if printer_state.absolute_coordinates || printer_state.homed_axes != "xyz" {
                             eprintln!("Refusing move in bad printer state: {:?}", printer_state)
                         } else {
-                            send_gcode_command(&mut ws_sender, &mut id_generator, &m.to_string()).await.expect("Failed to send move command");
+                            send_gcode_command(&mut ws_sender, &mut id_generator, &rpc_tracker, &m.to_string()).await.expect("Failed to send move command");
                         }
                     }
-                    PrinterCommand::Home => send_gcode_command(&mut ws_sender, &mut id_generator, "G28").await.expect("Failed to send home command"),
-                    PrinterCommand::SetRelativeMotion => send_gcode_command(&mut ws_sender, &mut id_generator, "G91").await.expect("Failed to send relative motion command"),
+                    PrinterCommand::Home => {send_gcode_command(&mut ws_sender, &mut id_generator, &rpc_tracker, "G28").await.expect("Failed to send home command");}
+                    PrinterCommand::SetRelativeMotion =>{ send_gcode_command(&mut ws_sender, &mut id_generator, &rpc_tracker, "G91").await.expect("Failed to send relative motion command");}
                 }
             }
             Some(Ok(msg)) = ws_receiver.next() => {
@@ -66,6 +93,11 @@ pub async fn connect_to_moonraker(url: &str, mut printer_rx: Receiver<PrinterCom
                     Message::Text(text) => {
                         let json: Value = serde_json::from_str(&text).unwrap();
                         log_recv(&json);
+                        if let Some(id) = json.get("id").and_then(|id| id.as_u64()) {
+                            if let Some(duration) = rpc_tracker.stop_tracking(id).await {
+                                println!("RPC call with id {} took {:?}", id, duration);
+                            }
+                        }
                         update_printer_state(&mut printer_state, &json).await;
                     }
                     Message::Close(_) => break,
@@ -83,6 +115,7 @@ fn log_recv(json: &Value) {
         match method.as_str().unwrap() {
             "notify_status_update" => {}
             "notify_proc_stat_update" => {}
+            "notify_service_state_changed" => {}
             _ => println!("recv: {}", serde_json::to_string_pretty(&json).unwrap())
         }
     } else {
@@ -123,18 +156,33 @@ fn update_from_status(state: &mut PrinterState, status: &Value) {
     }
 }
 
-async fn send_rpc(sender: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>, id_generator: &mut IdGenerator, method: &str, params: Value) -> Result<(), Error> {
+async fn send_rpc(
+    sender: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    id_generator: &mut IdGenerator,
+    rpc_tracker: &RpcTracker,
+    method: &str,
+    params: Value,
+) -> Result<u64, Error> {
+    let id = id_generator.next_id();
     let rpc_message = json!({
         "jsonrpc": "2.0",
         "method": method,
         "params": params,
-        "id": id_generator.next_id()
+        "id": id
     });
-    sender.send(Message::Text(rpc_message.to_string())).await
+    rpc_tracker.start_tracking(id).await;
+    sender.send(Message::Text(rpc_message.to_string())).await?;
+    Ok(id)
 }
 
-async fn send_gcode_command(sender: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>, id_generator: &mut IdGenerator, gcode: &str) -> Result<(), Error> {
-    send_rpc(sender, id_generator, "printer.gcode.script", json!({
+async fn send_gcode_command(
+    sender: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    id_generator: &mut IdGenerator,
+    rpc_tracker: &RpcTracker,
+    gcode: &str,
+) -> Result<u64, Error> {
+    println!("Sending GCode: {}", gcode);
+    send_rpc(sender, id_generator, rpc_tracker, "printer.gcode.script", json!({
         "script": gcode,
     })).await
 }
