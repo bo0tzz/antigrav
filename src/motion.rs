@@ -1,54 +1,46 @@
 use crate::constants::{printer_update_interval, PRINTER_TIME_STEP, SCALE_FACTORS};
-use crate::types::{MoveParameters};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Instant;
+use crate::types::{MoveParameters, PrinterCommand, Velocity};
 use spacenav_plus::MotionEvent;
-use crate::types::{PrinterCommand, Velocity};
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Mutex;
+use tokio::task;
+use std::sync::Arc;
+use std::time::Instant;
 
-pub fn start_motion_thread(
-    spacemouse_rx: Receiver<MotionEvent>,
-    printer_tx: Sender<PrinterCommand>
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let current_velocity = Arc::new(Mutex::new(Velocity::default()));
-        let mut last_handled_velocity = current_velocity.lock().unwrap().clone();
+pub async fn start_motion_thread(
+    mut spacemouse_rx: Receiver<MotionEvent>,
+    printer_tx: Sender<PrinterCommand>,
+) {
+    let current_velocity = Arc::new(Mutex::new(Velocity::default()));
 
-        let _velocity_update_thread = {
-            let current_velocity = Arc::clone(&current_velocity);
-            thread::spawn(move || {
-                loop {
-                    if let Ok(state) = spacemouse_rx.recv() {
-                        update_velocity(&current_velocity, &state);
-                    }
-                }
-            })
-        };
+    let vel = Arc::clone(&current_velocity);
+    task::spawn(async move {
+        while let Some(state) = spacemouse_rx.recv().await {
+            let mut v = vel.lock().await;
+            // Update velocity based on SpaceMouse state
+            // NOTE!: z and y axes are swapped here to map to the printer's movement system.
+            v.x = state.x as f32 * SCALE_FACTORS.x;
+            v.z = state.y as f32 * SCALE_FACTORS.z;
+            v.y = state.z as f32 * SCALE_FACTORS.y;
+        }
+    });
 
-        let mut last_command_time = Instant::now();
+    let mut last_command_time = Instant::now();
+    let mut last_handled_velocity = Velocity::default();
+    task::spawn(async move {
         loop {
-            let new_velocity = current_velocity.lock().unwrap().clone();
+            let new_velocity = current_velocity.lock().await.clone();
             if last_command_time.elapsed() >= printer_update_interval() && new_velocity != last_handled_velocity {
                 last_handled_velocity = new_velocity.clone();
-                generate_motion_commands(new_velocity, &printer_tx);
+                generate_motion_commands(new_velocity, &printer_tx).await;
                 last_command_time = Instant::now();
             }
-            thread::sleep(std::time::Duration::from_millis(1));
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-    })
+    });
 }
 
-fn update_velocity(velocity: &Arc<Mutex<Velocity>>, state: &MotionEvent) {
-    let mut vel = velocity.lock().unwrap();
-    // Update velocity based on SpaceMouse state
-    // NOTE!: z and y axes are swapped here to map to the printer's movement system.
-    vel.x = state.x as f32 * SCALE_FACTORS.x;
-    vel.z = state.y as f32 * SCALE_FACTORS.z;
-    vel.y = state.z as f32 * SCALE_FACTORS.y;
-}
-
-fn generate_motion_commands(velocity: Velocity, printer_tx: &Sender<PrinterCommand>) {
+async fn generate_motion_commands(velocity: Velocity, printer_tx: &Sender<PrinterCommand>) {
     let feedrate = calculate_feedrate(&velocity);
     if feedrate == 0 {
         return;
@@ -60,7 +52,7 @@ fn generate_motion_commands(velocity: Velocity, printer_tx: &Sender<PrinterComma
         feedrate,
     });
 
-    if let Err(e) = printer_tx.send(command) {
+    if let Err(e) = printer_tx.send(command).await {
         eprintln!("Failed to send printer command: {:?}", e);
     }
 }
